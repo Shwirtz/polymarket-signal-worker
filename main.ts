@@ -20,7 +20,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 
 const TRACKED_COINS = [
   'bitcoin', 'ethereum', 'solana', 'dogecoin', 'ripple',
-  'cardano', 'avalanche-2', 'chainlink', 'polkadot', 'matic-network',
+  'cardano', 'avalanche-2', 'chainlink', 'polkadot', 'polygon-ecosystem-token',
 ];
 
 const SIGNAL_EXPIRY_MS = 5 * 60 * 1000;       // 5 minutes
@@ -118,16 +118,22 @@ async function checkSignals(coinId: string) {
     }
   }
 
-  // 2. RSI extremes
+  // 2. RSI extremes (with price-variance guard to prevent false RSI=100 from identical REST prices)
   if (window.length >= 16) {
     const prices = window.map(t => t.price);
-    const rsi = computeRSI(prices);
-    if (rsi >= RSI_OVERBOUGHT || rsi <= RSI_OVERSOLD) {
-      await writeSignal(coinId, 'rsi_extreme', {
-        price: current.price,
-        rsi,
-        direction: rsi >= RSI_OVERBOUGHT ? 'overbought' : 'oversold',
-      });
+    // Check that prices actually vary — if all within 0.01% of each other, skip RSI
+    const minP = Math.min(...prices);
+    const maxP = Math.max(...prices);
+    const priceRange = minP > 0 ? (maxP - minP) / minP : 0;
+    if (priceRange > 0.0001) { // At least 0.01% variance required
+      const rsi = computeRSI(prices);
+      if (rsi >= RSI_OVERBOUGHT || rsi <= RSI_OVERSOLD) {
+        await writeSignal(coinId, 'rsi_extreme', {
+          price: current.price,
+          rsi,
+          direction: rsi >= RSI_OVERBOUGHT ? 'overbought' : 'oversold',
+        });
+      }
     }
   }
 
@@ -276,7 +282,8 @@ console.log(`REST poll interval: ${REST_POLL_INTERVAL_MS / 1000}s`);
 
 // Start REST polling (always works, primary data source)
 await pollPricesREST();
-setInterval(pollPricesREST, REST_POLL_INTERVAL_MS);
+// Delay first interval tick to avoid near-simultaneous second poll
+setTimeout(() => setInterval(pollPricesREST, REST_POLL_INTERVAL_MS), REST_POLL_INTERVAL_MS);
 
 // Attempt WebSocket connection (Analyst tier bonus — enhances with sub-second data)
 connectWebSocket();
