@@ -36,7 +36,7 @@ const RSI_OVERSOLD = 25;
 const VOLUME_SURGE_RATIO = 3;                   // 3x average
 const MIN_RSI_TICKS = 16;                       // Minimum ticks for RSI
 const MIN_PRICE_VARIANCE = 0.0005;              // 0.05% minimum variance
-const SIGNAL_DEDUP_MS = 2 * 60 * 1000;          // 2-minute dedup window
+const SIGNAL_DEDUP_MS = 5 * 60 * 1000;          // 5-minute dedup window
 
 // ---- Supabase Client ----
 
