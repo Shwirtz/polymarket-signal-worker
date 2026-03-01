@@ -6,6 +6,12 @@
  *   - SUPABASE_URL: Your Supabase project URL
  *   - SUPABASE_SERVICE_ROLE_KEY: Your Supabase service role key
  * 
+ * Optional env vars for threshold tuning:
+ *   - SPIKE_THRESHOLD (default: 0.02)
+ *   - RSI_OVERBOUGHT (default: 75)
+ *   - RSI_OVERSOLD (default: 25)
+ *   - VOLUME_SURGE_RATIO (default: 3)
+ * 
  * This worker is STATELESS — all price history is stored in the `price_ticks`
  * database table. Each invocation fetches prices, writes ticks, reads the
  * last 15 minutes from the DB, and computes signals. State survives restarts.
@@ -21,22 +27,32 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
 
-// ---- Configuration ----
+// ---- Configuration (env-overridable) ----
 
+// Ticket 1: Use 'matic-network' to match autopilot's COIN_PATTERNS mapping
 const TRACKED_COINS = [
   'bitcoin', 'ethereum', 'solana', 'dogecoin', 'ripple',
-  'cardano', 'avalanche-2', 'chainlink', 'polkadot', 'polygon-ecosystem-token',
+  'cardano', 'avalanche-2', 'chainlink', 'polkadot', 'matic-network',
 ];
 
 const SIGNAL_EXPIRY_MS = 5 * 60 * 1000;       // 5 minutes
 const PRICE_WINDOW_MS = 15 * 60 * 1000;       // 15-minute rolling window
-const SPIKE_THRESHOLD = 0.02;                   // 2% move in 5 min
-const RSI_OVERBOUGHT = 75;
-const RSI_OVERSOLD = 25;
-const VOLUME_SURGE_RATIO = 3;                   // 3x average
-const MIN_RSI_TICKS = 16;                       // Minimum ticks for RSI
-const MIN_PRICE_VARIANCE = 0.0005;              // 0.05% minimum variance
-const SIGNAL_DEDUP_MS = 5 * 60 * 1000;          // 5-minute dedup window
+const SIGNAL_DEDUP_MS = 5 * 60 * 1000;        // 5-minute dedup window
+const MIN_RSI_TICKS = 16;                     // Minimum ticks for RSI
+const MIN_PRICE_VARIANCE = 0.0005;            // 0.05% minimum variance
+
+// Ticket 6: Named cleanup constants (previously magic numbers)
+const SIGNAL_CLEANUP_MS = 10 * 60 * 1000;     // 10 minutes (intentionally > SIGNAL_EXPIRY_MS to allow late consumption)
+const TICK_RETENTION_MS = 60 * 60 * 1000;     // 1 hour tick retention
+
+// Ticket 5: Stale price threshold
+const STALE_THRESHOLD_S = 120;                // Skip prices older than 2 minutes
+
+// Env-overridable thresholds
+const SPIKE_THRESHOLD = Number(Deno.env.get('SPIKE_THRESHOLD') || '0.02');
+const RSI_OVERBOUGHT = Number(Deno.env.get('RSI_OVERBOUGHT') || '75');
+const RSI_OVERSOLD = Number(Deno.env.get('RSI_OVERSOLD') || '25');
+const VOLUME_SURGE_RATIO = Number(Deno.env.get('VOLUME_SURGE_RATIO') || '3');
 
 // ---- Supabase Client ----
 
@@ -50,6 +66,23 @@ if (!supabaseUrl || !supabaseKey || !cgKey) {
 }
 
 const db = createClient(supabaseUrl, supabaseKey);
+
+// ---- Ticket 4: Fetch with backoff, accepts headers ----
+
+async function fetchWithBackoff(url: string, headers: Record<string, string> = {}, maxRetries = 3): Promise<Response> {
+  const delays = [2000, 4000, 8000];
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, { 
+      headers,
+      signal: AbortSignal.timeout(12000) 
+    });
+    if (res.status !== 429 || attempt === maxRetries) return res;
+    const delay = delays[attempt] || 8000;
+    console.warn(`[BACKOFF] CoinGecko 429, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+    await new Promise(r => setTimeout(r, delay));
+  }
+  return await fetch(url, { headers });
+}
 
 // ---- Signal Detection (pure functions, no state) ----
 
@@ -82,12 +115,16 @@ async function detectSignals(coinId: string, ticks: PriceTick[]): Promise<Array<
   const signals: Array<{ type: string; data: Record<string, unknown> }> = [];
   if (ticks.length < 2) return signals;
 
-  const current = ticks[ticks.length - 1];
+  // Filter out zero/negative prices to prevent NaN/infinity in calculations
+  const validTicks = ticks.filter(t => t.price > 0);
+  if (validTicks.length < 2) return signals;
+
+  const current = validTicks[validTicks.length - 1];
   const now = Date.now();
 
   // 1. Price spike/crash: >2% move in last 5 minutes
   const fiveMinAgo = now - 5 * 60 * 1000;
-  const recentTicks = ticks.filter(t => new Date(t.created_at).getTime() >= fiveMinAgo);
+  const recentTicks = validTicks.filter(t => new Date(t.created_at).getTime() >= fiveMinAgo);
   if (recentTicks.length >= 2) {
     const oldest = recentTicks[0];
     const changePct = (current.price - oldest.price) / oldest.price;
@@ -106,14 +143,13 @@ async function detectSignals(coinId: string, ticks: PriceTick[]): Promise<Array<
   }
 
   // 2. RSI extremes (with strict variance guard)
-  if (ticks.length >= MIN_RSI_TICKS) {
-    const prices = ticks.map(t => t.price);
+  if (validTicks.length >= MIN_RSI_TICKS) {
+    const prices = validTicks.map(t => t.price);
     const minP = Math.min(...prices);
     const maxP = Math.max(...prices);
     const priceRange = minP > 0 ? (maxP - minP) / minP : 0;
     if (priceRange > MIN_PRICE_VARIANCE) {
       const rsi = computeRSI(prices);
-      // Never emit RSI=100 — it's always an artifact
       if (rsi < 100 && (rsi >= RSI_OVERBOUGHT || rsi <= RSI_OVERSOLD)) {
         signals.push({
           type: 'rsi_extreme',
@@ -121,7 +157,7 @@ async function detectSignals(coinId: string, ticks: PriceTick[]): Promise<Array<
             price: current.price,
             rsi: Math.round(rsi * 100) / 100,
             direction: rsi >= RSI_OVERBOUGHT ? 'overbought' : 'oversold',
-            tick_count: ticks.length,
+            tick_count: validTicks.length,
             price_variance_pct: Math.round(priceRange * 10000) / 100,
           },
         });
@@ -130,7 +166,7 @@ async function detectSignals(coinId: string, ticks: PriceTick[]): Promise<Array<
   }
 
   // 3. Volume surge
-  const volumes = ticks.map(t => t.volume).filter(v => v > 0);
+  const volumes = validTicks.map(t => t.volume).filter(v => v > 0);
   if (volumes.length >= 10) {
     const avgVol = volumes.slice(0, -3).reduce((a, b) => a + b, 0) / (volumes.length - 3);
     const recentVol = volumes.slice(-3).reduce((a, b) => a + b, 0) / 3;
@@ -145,6 +181,29 @@ async function detectSignals(coinId: string, ticks: PriceTick[]): Promise<Array<
     }
   }
 
+  // 4. Bollinger Squeeze: bandwidth < 2% of SMA
+  if (validTicks.length >= 20) {
+    const prices = validTicks.slice(-20).map(t => t.price);
+    const sma = prices.reduce((a, b) => a + b, 0) / prices.length;
+    if (sma > 0) {
+      const variance = prices.reduce((sum, p) => sum + (p - sma) ** 2, 0) / prices.length;
+      const stdDev = Math.sqrt(variance);
+      const bandwidth = (2 * stdDev) / sma;
+      if (bandwidth < 0.02) {
+        signals.push({
+          type: 'bollinger_squeeze',
+          data: {
+            price: current.price,
+            sma: Math.round(sma * 100) / 100,
+            bandwidth_pct: Math.round(bandwidth * 10000) / 100,
+            stddev: Math.round(stdDev * 100) / 100,
+            tick_count: 20,
+          },
+        });
+      }
+    }
+  }
+
   return signals;
 }
 
@@ -156,28 +215,45 @@ async function poll(): Promise<{ prices: number; signals: number; ticks: number;
   let signalCount = 0;
   let tickCount = 0;
 
-  // Step 1: Fetch prices from CoinGecko REST
+  // Step 1: Fetch prices from CoinGecko REST (Ticket 4: header auth, Ticket 5: include_last_updated_at)
   let priceData: Record<string, any> = {};
   try {
     const ids = TRACKED_COINS.join(',');
-    const res = await fetch(
-      `https://pro-api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true&x_cg_pro_api_key=${cgKey}`
+    const res = await fetchWithBackoff(
+      `https://pro-api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true&include_last_updated_at=true`,
+      { 'x-cg-pro-api-key': cgKey }
     );
     if (!res.ok) {
       errors.push(`CoinGecko API ${res.status}`);
       return { prices: 0, signals: 0, ticks: 0, errors };
     }
     priceData = await res.json();
+
+    // Ticket 7: Log rate limit header for diagnostics
+    const remaining = res.headers.get('x-ratelimit-remaining');
+    if (remaining !== null) {
+      console.log(`[CG] Status: ${res.status}, rate-limit-remaining: ${remaining}, coins returned: ${Object.keys(priceData).length}`);
+    }
   } catch (e) {
     errors.push(`CoinGecko fetch failed: ${e}`);
     return { prices: 0, signals: 0, ticks: 0, errors };
   }
 
-  // Step 2: Insert ticks into price_ticks table
+  // Step 2: Insert ticks into price_ticks table (Ticket 5: stale price filter)
   const tickRows: Array<{ coin_id: string; price: number; volume: number }> = [];
   for (const coinId of TRACKED_COINS) {
     const coin = priceData[coinId];
     if (!coin || !coin.usd || coin.usd <= 0) continue;
+
+    // Ticket 5: Skip stale prices
+    if (coin.last_updated_at) {
+      const ageSeconds = Math.floor(Date.now() / 1000) - coin.last_updated_at;
+      if (ageSeconds > STALE_THRESHOLD_S) {
+        console.warn(`[STALE] ${coinId} price is ${ageSeconds}s old, skipping`);
+        continue;
+      }
+    }
+
     tickRows.push({
       coin_id: coinId,
       price: coin.usd,
@@ -215,22 +291,33 @@ async function poll(): Promise<{ prices: number; signals: number; ticks: number;
     ticksByCoin.set(tick.coin_id, arr);
   }
 
-  // Step 4: Detect signals for each coin
+  // Step 4: Detect signals for each coin (Ticket 3: batch dedup)
+  const allDetected: Array<{ coinId: string; signal: { type: string; data: Record<string, unknown> } }> = [];
+
   for (const [coinId, ticks] of ticksByCoin) {
     const signals = await detectSignals(coinId, ticks);
     for (const signal of signals) {
-      // Dedup: check if same signal type exists for this coin in last 2 minutes
-      const dedupCutoff = new Date(Date.now() - SIGNAL_DEDUP_MS).toISOString();
-      const { data: existing } = await db.from('bot_signals')
-        .select('id')
-        .eq('coin_id', coinId)
-        .eq('signal_type', signal.type)
-        .gte('created_at', dedupCutoff)
-        .limit(1);
+      allDetected.push({ coinId, signal });
+    }
+  }
 
-      if (existing && existing.length > 0) continue;
+  if (allDetected.length > 0) {
+    // Single batch query: fetch ALL recent signals for dedup
+    const dedupCutoff = new Date(Date.now() - SIGNAL_DEDUP_MS).toISOString();
+    const { data: recentSignals } = await db.from('bot_signals')
+      .select('coin_id, signal_type')
+      .gte('created_at', dedupCutoff);
 
-      // Write signal
+    // Build a Set for O(1) lookup: "coinId::signalType"
+    const existingKeys = new Set(
+      (recentSignals || []).map((s: any) => `${s.coin_id}::${s.signal_type}`)
+    );
+
+    // Write only non-duplicate signals
+    for (const { coinId, signal } of allDetected) {
+      const key = `${coinId}::${signal.type}`;
+      if (existingKeys.has(key)) continue;
+
       const { error } = await db.from('bot_signals').insert({
         signal_type: signal.type,
         coin_id: coinId,
@@ -241,17 +328,17 @@ async function poll(): Promise<{ prices: number; signals: number; ticks: number;
 
       if (!error) {
         signalCount++;
+        existingKeys.add(key);
         console.log(`[SIGNAL] ${signal.type} for ${coinId}:`, JSON.stringify(signal.data));
       }
     }
   }
 
-  // Step 5: Cleanup old ticks (>1 hour) to prevent table bloat
-  const cleanupCutoff = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  await db.from('price_ticks').delete().lt('created_at', cleanupCutoff);
+  // Step 5: Cleanup old ticks to prevent table bloat (Ticket 6: named constant)
+  await db.from('price_ticks').delete().lt('created_at', new Date(Date.now() - TICK_RETENTION_MS).toISOString());
 
-  // Step 6: Cleanup expired signals (>10 min old)
-  await db.from('bot_signals').delete().lt('created_at', new Date(Date.now() - 10 * 60 * 1000).toISOString());
+  // Step 6: Cleanup expired signals (buffer beyond SIGNAL_EXPIRY_MS for late consumers)
+  await db.from('bot_signals').delete().lt('created_at', new Date(Date.now() - SIGNAL_CLEANUP_MS).toISOString());
 
   return { prices: priceCount, signals: signalCount, ticks: tickCount, errors };
 }
@@ -275,34 +362,44 @@ Deno.serve({ port: 8000 }, async (req) => {
   }
 
   if (url.pathname === '/health') {
-    // DB-backed health check — no in-memory state needed
-    const windowStart = new Date(Date.now() - PRICE_WINDOW_MS).toISOString();
-    const { data: tickCounts } = await db.from('price_ticks')
-      .select('coin_id')
-      .gte('created_at', windowStart);
+    // 1b. Enhanced health endpoint with richer metrics
+    const now = Date.now();
+    const windowStart = new Date(now - PRICE_WINDOW_MS).toISOString();
+    const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+    const fiveMinAgo = new Date(now - 5 * 60 * 1000).toISOString();
+
+    const [tickResult, signalsHourResult, recentSignalResult, recentTickResult] = await Promise.all([
+      db.from('price_ticks').select('coin_id').gte('created_at', windowStart),
+      db.from('bot_signals').select('id').gte('created_at', oneHourAgo),
+      db.from('bot_signals')
+        .select('signal_type, coin_id, created_at')
+        .gte('created_at', new Date(now - 10 * 60 * 1000).toISOString())
+        .neq('signal_type', 'heartbeat')
+        .order('created_at', { ascending: false })
+        .limit(20),
+      db.from('price_ticks').select('coin_id').gte('created_at', fiveMinAgo),
+    ]);
 
     const coinTicks = new Map<string, number>();
-    if (tickCounts) {
-      for (const t of tickCounts) {
+    if (tickResult.data) {
+      for (const t of tickResult.data) {
         coinTicks.set(t.coin_id, (coinTicks.get(t.coin_id) || 0) + 1);
       }
     }
 
-    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-    const { data: recentSignals } = await db.from('bot_signals')
-      .select('signal_type, coin_id, created_at')
-      .gte('created_at', tenMinAgo)
-      .neq('signal_type', 'heartbeat')
-      .order('created_at', { ascending: false })
-      .limit(20);
+    // Coins with data in last 5 min
+    const coinsWithRecentData = new Set(recentTickResult.data?.map((t: any) => t.coin_id) || []);
 
     const status = {
       mode: 'stateless-db-backed',
       coins: TRACKED_COINS.length,
       ticksInWindow: Object.fromEntries(coinTicks),
-      totalTicksInWindow: tickCounts?.length || 0,
-      recentSignals: recentSignals?.length || 0,
-      signals: recentSignals || [],
+      totalTicksInWindow: tickResult.data?.length || 0,
+      signals_generated_last_hour: signalsHourResult.data?.length || 0,
+      coins_with_recent_data: [...coinsWithRecentData],
+      recentSignals: recentSignalResult.data?.length || 0,
+      signals: recentSignalResult.data || [],
+      thresholds: { SPIKE_THRESHOLD, RSI_OVERBOUGHT, RSI_OVERSOLD, VOLUME_SURGE_RATIO },
     };
     return new Response(JSON.stringify(status, null, 2), {
       headers: { 'Content-Type': 'application/json' },
@@ -312,10 +409,12 @@ Deno.serve({ port: 8000 }, async (req) => {
   return new Response('PolyTerminal Signal Worker (stateless)', { status: 200 });
 });
 
-// ---- Deno Deploy Cron: poll every 30 seconds for high-frequency signal detection ----
-Deno.cron('poll-prices', '* * * * *', async () => {
-  // Cron runs every minute; we do 2 polls (0s and 30s) for ~30s frequency
+// ---- Ticket 2: Two named crons for reliable ~30s polling ----
+Deno.cron('poll-prices-a', '* * * * *', async () => {
   await poll();
+});
+
+Deno.cron('poll-prices-b', '* * * * *', async () => {
   await new Promise(r => setTimeout(r, 30_000));
   await poll();
 });
