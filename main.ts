@@ -46,7 +46,7 @@ const SIGNAL_CLEANUP_MS = 10 * 60 * 1000;     // 10 minutes (intentionally > SIG
 const TICK_RETENTION_MS = 60 * 60 * 1000;     // 1 hour tick retention
 
 // Ticket 5: Stale price threshold
-const STALE_THRESHOLD_S = 120;                // Skip prices older than 2 minutes
+const STALE_THRESHOLD_S = 300;                // Skip prices older than 2 minutes
 
 // Env-overridable thresholds
 const SPIKE_THRESHOLD = Number(Deno.env.get('SPIKE_THRESHOLD') || '0.02');
